@@ -38,7 +38,7 @@ bytes4 takeOrderSelector = UniswapV2ExchangeAdapter.takeOrder.selector;
 
 #### 第 2 步：準備 IntegrationManager 的調用數據 (中間層)
 
-接下來，需要將 **第 1 步** 的 `Adapter` 地址、`selector` 和 `integrationData` 打包成 `IntegrationManager` 所期望的 `_callArgs` 格式。
+接下來，需要將 **第 1 步** 的 `Adapter` 地址、`selector` 和 `integrationData` 打包成 `IntegrationManager` 所期望的 `_callArgs` 格式。  
 
 `ComptrollerLib` 在調用 `IntegrationManager` 時，會傳入一個 `_callArgs` 參數，`IntegrationManager` 會將其解碼為 `(address adapter, bytes4 selector, bytes memory integrationData)`。因此，我們需要將這三者進行緊密打包的 ABI 編碼。
 

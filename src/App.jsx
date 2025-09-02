@@ -14,10 +14,11 @@ const REQUIRED_CHAIN_PARAMS = {
     blockExplorerUrls: ["https://sepolia.etherscan.io"],
 };
 
-// ====== Minimal ABIs ======
+// ===== ABIs =====
 const FUND_FACTORY_ABI = [
     "function createNewFund(address _fundOwner,string _fundName,string _fundSymbol,address _denominationAsset,uint256 _sharesActionTimelock,bytes _feeManagerConfigData,bytes _policyManagerConfigData) returns (address,address)",
 ];
+
 const COMPTROLLER_ABI = [
     "function getVaultProxy() view returns (address)",
     "function getDenominationAsset() view returns (address)",
@@ -25,8 +26,10 @@ const COMPTROLLER_ABI = [
     "function calcGav() view returns (uint256)",
     "function calcGrossShareValue() view returns (uint256)",
     "function buySharesWithEth(uint256 _minSharesQuantity) payable",
+    // 你的 fork 將 redeem 暴露在 Comptroller（你已成功用過）
     "function redeemSharesInKind(address _recipient,uint256 _sharesQty,address[] _additionalAssets,address[] _assetsToSkip) returns (address[],uint256[])",
-    "function redeemSharesForSpecificAssets(address _recipient,uint256 _sharesQty,address[] _payoutAssets,uint256[] _payoutPercents) returns (uint256[])"
+    "function redeemSharesForSpecificAssets(address _recipient,uint256 _sharesQty,address[] _payoutAssets,uint256[] _payoutPercents) returns (uint256[])",
+    "function callOnExtension(address _extension,uint256 _actionId,bytes _callArgs)"
 ];
 
 const VAULT_PROXY_ABI = [
@@ -35,6 +38,7 @@ const VAULT_PROXY_ABI = [
     "function redeemSharesForSpecificAssets(address _recipient,uint256 _sharesQty,address[] _payoutAssets,uint256[] _payoutPercents) returns (uint256[])",
     "function callOnExtension(address _extension,uint256 _actionId,bytes _callData)"
 ];
+
 const ERC20_ABI = [
     "function balanceOf(address) view returns (uint256)",
     "function allowance(address,address) view returns (uint256)",
@@ -43,8 +47,15 @@ const ERC20_ABI = [
     "function decimals() view returns (uint8)",
     "function transfer(address,uint256) returns (bool)",
 ];
-const UNISWAP_ADAPTER_ABI = ["function takeOrder(bytes _orderData)"];
+
+// V2 adapter：takeOrder(bytes)；加上 parseAssetsForAction 作 preflight
+const UNISWAP_ADAPTER_ABI = [
+    "function takeOrder(bytes _orderData)",
+    "function parseAssetsForAction(bytes4 _selector, bytes _encodedCallArgs) view returns (uint8,uint256,address[],uint256[],address[],uint256[])"
+];
+
 const INTEGRATION_ACTION_CALL = 0;
+
 const AddressListRegistryABI = [
     "function createList(address owner,uint8 updateType,address[] initialItems) returns (uint256 listId)",
     "event ListCreated(uint256 indexed listId, address indexed owner, uint8 updateType, address[] initialItems)",
@@ -58,11 +69,7 @@ const SHARES_ABI = [
 ];
 
 function isHexAddress(addr) {
-    try {
-        return ethers.isAddress(addr);
-    } catch {
-        return false;
-    }
+    try { return ethers.isAddress(addr); } catch { return false; }
 }
 
 export default function App() {
@@ -76,13 +83,11 @@ export default function App() {
     // UI state
     const [appTab, setAppTab] = useState("TRANSFER"); // TRANSFER | INVEST | SWAP | ENZYME
     const [mode, setMode] = useState("ERC20"); // "NATIVE" | "ERC20"
-    const [status, setStatus] = useState(null); // { type: 'error'|'success'|'info', message: string, hash?: string }
+    const [status, setStatus] = useState(null); // { type, message, hash? }
 
-    // Inputs (Transfer)
+    // Transfer
     const [recipient, setRecipient] = useState("");
     const [amount, setAmount] = useState("");
-
-    // Token state (Transfer)
     const [tokenAddr, setTokenAddr] = useState("");
     const [tokenSymbol, setTokenSymbol] = useState("");
     const [tokenDecimals, setTokenDecimals] = useState(18);
@@ -91,7 +96,7 @@ export default function App() {
     // Native balance
     const [nativeBalance, setNativeBalance] = useState("0");
 
-    // Enzyme
+    // Enzyme (create)
     const [fundName, setFundName] = useState("My Sepolia Fund");
     const [fundSymbol, setFundSymbol] = useState("MSF");
     const [feeRecipient, setFeeRecipient] = useState("");
@@ -100,27 +105,28 @@ export default function App() {
     const [createdComptroller, setCreatedComptroller] = useState("");
     const [createdVault, setCreatedVault] = useState("");
 
-    // ===== Invest (Subscribe / Redeem) state =====
-    const [cpAddr, setCpAddr] = useState("");             // ComptrollerProxy address
-    const [investAmt, setInvestAmt] = useState("");       // 投資金額（以 denom decimals）
-    const [minShares, setMinShares] = useState("");       // 最低可接受份額
-    const [vaultAddr, setVaultAddr] = useState("");       // VaultProxy address（也可由 cpAddr 讀）
-    const [redeemShares, setRedeemShares] = useState(""); // 要贖回的份額數量
-    const [redeemAssets, setRedeemAssets] = useState("");     // Specific 贖回：0xUSDC,0xWETH
-    const [redeemPercents, setRedeemPercents] = useState(""); // Specific 贖回：7000,3000（總和=10000）
-    // Invest: denomination info (manual or auto)
+    // Invest
+    const [cpAddr, setCpAddr] = useState("");          // ComptrollerProxy
+    const [investAmt, setInvestAmt] = useState("");
+    const [minShares, setMinShares] = useState("");
+    const [vaultAddr, setVaultAddr] = useState("");    // optional, you也可自動讀
+    const [redeemShares, setRedeemShares] = useState("");
+    const [redeemAssets, setRedeemAssets] = useState("");     // e.g. WETH,USDC 或地址
+    const [redeemPercents, setRedeemPercents] = useState(""); // bps 或 70,30 或 0.7,0.3
     const [denomAddr, setDenomAddr] = useState("");
     const [denomSymbol, setDenomSymbol] = useState("");
     const [denomDecimals, setDenomDecimals] = useState(18);
-    const [myShares, setMyShares] = useState(null); // { amount, total, symbol, vault }
+    const [myShares, setMyShares] = useState(null);
 
+    // Swap
+    const [fundCpForSwap, setFundCpForSwap] = useState("");
+    const [sellAmt, setSellAmt] = useState("");
+    const [minBuyAmt, setMinBuyAmt] = useState("");
+    const [swapPath, setSwapPath] = useState("");
+    const [imAddr, setImAddr] = useState(ENZYME.INTEGRATION_MANAGER || "");
+    const [uniAdapter, setUniAdapter] = useState(ENZYME.UNISWAP_ADAPTER || ""); // 你的 adapter（非 V2 也可）
 
-    // ===== Swap (Uniswap via IntegrationManager) state =====
-    const [fundCpForSwap, setFundCpForSwap] = useState("");   // 用來查 Vault
-    const [sellAmt, setSellAmt] = useState("");               // 賣出 token 數量（outgoing）
-    const [minBuyAmt, setMinBuyAmt] = useState("");           // 最少收到（incoming）
-    const [swapPath, setSwapPath] = useState("");             // 逗號分隔：0xWETH,0xDAI
-
+    // ===== Effects =====
     useEffect(() => {
         const ethereum = window.ethereum;
         setHasMM(!!ethereum);
@@ -146,21 +152,17 @@ export default function App() {
                 const net = await p2.getNetwork();
                 setNetworkName(net?.name || "");
             } catch { }
-            // 用新的 provider 刷新餘額
             refreshBalances(p2, account, tokenAddr);
-            if (id !== REQUIRED_CHAIN_ID) {
-                setStatus({ type: "error", message: "Wrong network. Please switch to Sepolia (11155111)." });
-            } else {
-                setStatus({ type: "success", message: "Switched to Sepolia." });
-            }
+            setStatus(id !== REQUIRED_CHAIN_ID
+                ? { type: "error", message: "Wrong network. Please switch to Sepolia (11155111)." }
+                : { type: "success", message: "Switched to Sepolia." }
+            );
         };
 
         ethereum.request({ method: "eth_accounts" }).then(handleAccounts).catch(() => { });
         ethereum.request({ method: "eth_chainId" }).then((cidHex) => handleChainChanged(cidHex)).catch(() => { });
-
         ethereum.on("accountsChanged", handleAccounts);
         ethereum.on("chainChanged", handleChainChanged);
-
         return () => {
             ethereum.removeListener("accountsChanged", handleAccounts);
             ethereum.removeListener("chainChanged", handleChainChanged);
@@ -172,6 +174,22 @@ export default function App() {
         refreshBalances(provider, account, tokenAddr);
     }, [provider, account, tokenAddr, mode]);
 
+    // 安全注入 IM / Adapter 預設地址（避免在渲染期直接讀 ENZYME 造成白屏）
+    useEffect(() => {
+        try {
+            if (ENZYME && ethers.isAddress(ENZYME.INTEGRATION_MANAGER)) {
+                setImAddr(ENZYME.INTEGRATION_MANAGER);
+            }
+            if (ENZYME && ethers.isAddress(ENZYME.UNISWAP_ADAPTER)) {
+                setUniAdapter(ENZYME.UNISWAP_ADAPTER);
+            }
+        } catch (_) {
+            // 忽略；使用者可以手動輸入
+        }
+    }, []);
+
+
+    // ===== Helpers (logic) =====
     async function refreshBalances(p, acc, tAddr) {
         try {
             if (acc) {
@@ -198,19 +216,11 @@ export default function App() {
     async function switchToSepolia() {
         if (!window.ethereum) throw new Error("MetaMask not detected");
         try {
-            await window.ethereum.request({
-                method: "wallet_switchEthereumChain",
-                params: [{ chainId: REQUIRED_CHAIN_HEX }],
-            });
+            await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: REQUIRED_CHAIN_HEX }] });
         } catch (e) {
             if (e?.code === 4902) {
-                await window.ethereum.request({
-                    method: "wallet_addEthereumChain",
-                    params: [REQUIRED_CHAIN_PARAMS],
-                });
-            } else {
-                throw e;
-            }
+                await window.ethereum.request({ method: "wallet_addEthereumChain", params: [REQUIRED_CHAIN_PARAMS] });
+            } else { throw e; }
         }
     }
 
@@ -220,7 +230,6 @@ export default function App() {
             const accs = await window.ethereum.request({ method: "eth_requestAccounts" });
             const next = accs?.[0] ?? "";
 
-            // 先確認/切換到目標鏈
             let cidHex = await window.ethereum.request({ method: "eth_chainId" });
             if (parseInt(cidHex, 16) !== REQUIRED_CHAIN_ID) {
                 await switchToSepolia();
@@ -230,13 +239,11 @@ export default function App() {
                 }
             }
 
-            // 👉 切好鏈之後，再建立全新的 Provider / Signer
             const p = new ethers.BrowserProvider(window.ethereum);
             const s = next ? await p.getSigner() : null;
             setProvider(p);
             setSigner(s);
             setAccount(next);
-
             setChainId(REQUIRED_CHAIN_ID);
             setNetworkName("sepolia");
             if (!feeRecipient && next) setFeeRecipient(next);
@@ -269,11 +276,7 @@ export default function App() {
                 const tx = await erc.transfer(recipient, value);
                 setStatus({ type: "info", message: `Sent. Waiting for confirmation...`, hash: tx.hash });
                 const rec = await tx.wait();
-                setStatus({
-                    type: "success",
-                    message: `${amount} ${tokenSymbol || "tokens"} transferred. Block ${rec.blockNumber}.`,
-                    hash: tx.hash,
-                });
+                setStatus({ type: "success", message: `${amount} ${tokenSymbol || "tokens"} transferred. Block ${rec.blockNumber}.`, hash: tx.hash });
             }
             if (provider && account) await refreshBalances(provider, account, tokenAddr);
         } catch (err) {
@@ -287,49 +290,42 @@ export default function App() {
         try {
             await window.ethereum.request({
                 method: "wallet_watchAsset",
-                params: {
-                    type: "ERC20",
-                    options: { address: tokenAddr, symbol: tokenSymbol || "TKN", decimals: tokenDecimals || 18 },
-                },
+                params: { type: "ERC20", options: { address: tokenAddr, symbol: tokenSymbol || "TKN", decimals: tokenDecimals || 18 } },
             });
         } catch (err) {
             setStatus({ type: "error", message: shortErr(err) });
         }
     }
 
-    // ===== New handlers =====
+    // ===== Invest handlers =====
     async function handleApproveAndBuyShares() {
         try {
             if (!signer) throw new Error("Connect wallet first");
             if (!ethers.isAddress(cpAddr)) throw new Error("Invalid ComptrollerProxy");
 
             const cp = new ethers.Contract(cpAddr, COMPTROLLER_ABI, signer);
-            // 1) 拿 Vault + Denom（Denom 先用手動欄位，若沒填再嘗試偵測）
-            const [vault, denom] = await Promise.all([
-                cp.getVaultProxy(),
-                resolveDenominationAddressOrThrow(),
-            ]);
+            // 優先用手動 denom，其次嘗試讀取
+            const [vault, denom] = await Promise.all([cp.getVaultProxy(), resolveDenominationAddressOrThrow()]);
             const erc = new ethers.Contract(denom, ERC20_ABI, signer);
             const decimals = await erc.decimals();
             const amt = ethers.parseUnits(investAmt || "0", Number(decimals));
+
+            // minShares：使用者填了就用；否則用 gsv 推估並留 1% buffer，且至少 1 wei
             let min;
             if (minShares && Number(minShares) > 0) {
-                // user provided a positive minShares
                 min = ethers.parseUnits(minShares, 18);
             } else {
-                // auto-estimate from current gross share value with a 1% buffer
-                // and ensure it's at least 1 wei share
-                const gsv = await cp.calcGrossShareValue(); // denom-per-share (scaled, shares assumed 18)
+                const gsv = await cp.calcGrossShareValue().catch(() => 0n);
                 if (gsv > 0n) {
                     const ONE_E18 = 10n ** 18n;
-                    const expected = (amt * ONE_E18) / gsv;               // expected shares (18 decimals)
-                    const withBuffer = (expected * 9900n) / 10000n;       // 1% slippage buffer
-                    min = withBuffer > 0n ? withBuffer : 1n;              // must be > 0
+                    const expected = (amt * ONE_E18) / gsv;
+                    const withBuffer = (expected * 9900n) / 10000n; // 1% buffer
+                    min = withBuffer > 0n ? withBuffer : 1n;
                 } else {
-                    // brand-new fund (share value = 0): require strictly > 0
-                    min = 1n; // 1 wei share
+                    min = 1n;
                 }
             }
+
             await ensureAllowance(erc, account, vault, amt, "Vault");
             await ensureAllowance(erc, account, cpAddr, amt, "Comptroller");
 
@@ -342,14 +338,14 @@ export default function App() {
             setStatus({ type: "error", message: shortErr(err) });
         }
     }
-    // 用 ETH 直接申購（只適用 denom = WETH 的基金）
+
+    // 用 ETH 直接申購（只適用 denom=WETH）
     async function handleBuySharesWithEth() {
         try {
             if (!signer) throw new Error("Connect wallet first");
             if (!ethers.isAddress(cpAddr)) throw new Error("Invalid ComptrollerProxy");
             if (!investAmt || Number(investAmt) <= 0) throw new Error("Enter investment amount");
 
-            // 可選：若拿得到 denom，先檢查是不是 WETH（不是就阻止，避免白付 gas）
             try {
                 const ABI = ["function getDenominationAsset() view returns (address)"];
                 const cpView = new ethers.Contract(cpAddr, ABI, provider || signer);
@@ -358,28 +354,23 @@ export default function App() {
                     denom?.toLowerCase?.() !== ENZYME.WETH.toLowerCase()) {
                     throw new Error("buySharesWithEth is only supported when denomination asset is WETH");
                 }
-            } catch {
-                // 有些 fork 沒這個 getter，就放行讓合約自己判斷
-            }
+            } catch { /* 沒 getter 就放行，由合約自行判斷 */ }
 
             const cp = new ethers.Contract(cpAddr, COMPTROLLER_ABI, signer);
-            const value = ethers.parseUnits(investAmt, 18); // ETH 18 位
+            const value = ethers.parseUnits(investAmt, 18);
 
-            // 計算一個 >0 的 minShares（1% 緩衝；若剛開基金則至少 1 wei）
             let min;
             try {
-                const gsv = await cp.calcGrossShareValue(); // denom per 1 share
+                const gsv = await cp.calcGrossShareValue();
                 if (gsv > 0n) {
                     const ONE_E18 = 10n ** 18n;
                     const expected = (value * ONE_E18) / gsv;
-                    const withBuffer = (expected * 9900n) / 10000n; // 1% buffer
+                    const withBuffer = (expected * 9900n) / 10000n;
                     min = withBuffer > 0n ? withBuffer : 1n;
                 } else {
                     min = 1n;
                 }
-            } catch {
-                min = 1n;
-            }
+            } catch { min = 1n; }
 
             const tx = await cp.buySharesWithEth(min, { value });
             setStatus({ type: "info", message: `buySharesWithEth sent…`, hash: tx.hash });
@@ -391,7 +382,6 @@ export default function App() {
         }
     }
 
-    // 一鍵 Wrap：把 ETH 兌成 WETH（用 Investment amount 當金額）
     async function wrapEthQuick() {
         try {
             if (!signer) throw new Error("Connect wallet first");
@@ -423,15 +413,12 @@ export default function App() {
             setStatus({ type: "info", message: `Redeeming in kind…`, hash: tx.hash });
             const rc = await tx.wait();
             setStatus({ type: "success", message: `Redeemed (in-kind). Block ${rc.blockNumber}.`, hash: tx.hash });
-
-            // 更新顯示
             await fetchMyShares?.();
         } catch (err) {
             console.error(err);
             setStatus({ type: "error", message: shortErr(err) });
         }
     }
-
 
     async function handleRedeemSpecific() {
         try {
@@ -442,97 +429,131 @@ export default function App() {
             const sharesQty = ethers.parseUnits(redeemShares || "0", 18);
             if (sharesQty <= 0n) throw new Error("Shares must be > 0");
 
-            const assets = redeemAssets.split(",").map(s => s.trim()).filter(ethers.isAddress);
-            const percents = redeemPercents.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n));
-            if (assets.length === 0 || assets.length !== percents.length) throw new Error("Invalid assets/percentages");
-            const sum = percents.reduce((a, b) => a + b, 0);
-            if (sum !== 10000) throw new Error("Percentages must sum to 10000");
+            const assets = parseAssetsFlexible(redeemAssets);
+            const percents = parsePercentsToBps(redeemPercents);
+            if (assets.length === 0) throw new Error("No assets provided");
+            if (assets.length !== percents.length) throw new Error(`Assets (${assets.length}) and percentages (${percents.length}) mismatch`);
 
             const tx = await cp.redeemSharesForSpecificAssets(account, sharesQty, assets, percents);
             setStatus({ type: "info", message: `Redeeming for specific assets…`, hash: tx.hash });
             const rc = await tx.wait();
             setStatus({ type: "success", message: `Redeemed (specific). Block ${rc.blockNumber}.`, hash: tx.hash });
-
             await fetchMyShares?.();
         } catch (err) {
             console.error(err);
             setStatus({ type: "error", message: shortErr(err) });
         }
     }
+    // 檢查 Vault 是否持有 path[0] 且餘額足夠
+    async function checkVaultHasSellToken(cpAddrUse, sellToken, needAmountBN, sellTokenDecimals) {
+        const cp = new ethers.Contract(cpAddrUse, COMPTROLLER_ABI, provider || signer);
+        const vault = await cp.getVaultProxy();
 
+        const erc = new ethers.Contract(sellToken, ERC20_ABI, provider || signer);
+        const [sym, bal] = await Promise.all([
+            erc.symbol().catch(() => ""),
+            erc.balanceOf(vault),
+        ]);
 
+        if (bal < needAmountBN) {
+            const have = ethers.formatUnits(bal, Number(sellTokenDecimals));
+            const need = ethers.formatUnits(needAmountBN, Number(sellTokenDecimals));
+            throw new Error(`Vault ${shortAddr(vault)} 的 ${sym || "token"} 餘額不足：擁有 ${have}，需要 ${need}`);
+        }
+        return { vault, sym };
+    }
+
+    // ===== Swap via IntegrationManager (Uniswap V2: takeOrder(address,bytes,bytes)) =====
     async function handleSwapViaIM() {
         try {
             if (!signer) throw new Error("Connect wallet first");
-            if (!ethers.isAddress(fundCpForSwap)) throw new Error("Invalid ComptrollerProxy");
-            if (!ethers.isAddress(ENZYME.INTEGRATION_MANAGER)) throw new Error("Missing IntegrationManager");
-            if (!ethers.isAddress(ENZYME.UNISWAP_V2_EXCHANGE_ADAPTER)) throw new Error("Missing Uniswap adapter");
 
-            const cp = new ethers.Contract(fundCpForSwap, COMPTROLLER_ABI, signer);
-            const vault = await cp.getVaultProxy();
+            // 用 SWAP 分頁的 CP 或 INVEST 分頁的 CP
+            const cpAddrUse = fundCpForSwap || cpAddr;
+            if (!ethers.isAddress(cpAddrUse)) throw new Error("Invalid ComptrollerProxy");
 
-            // 簡化：假設 outgoing token 為 18 位；若要更精準，可讀取 path[0] 的 decimals
-            const decimals = 18;
-            const outgoing = ethers.parseUnits(sellAmt || "0", decimals);
-            const minIncoming = ethers.parseUnits(minBuyAmt || "0", 18);
-            const path = swapPath.split(",").map(s => s.trim()).filter(ethers.isAddress);
-            if (path.length < 2) throw new Error("Invalid path");
+            // 解析 IM / Adapter（留空就用 ENZYME 預設）
+            const IM = ethers.isAddress(imAddr) ? imAddr : ENZYME.INTEGRATION_MANAGER;
+            const ADP = ethers.isAddress(uniAdapter) ? uniAdapter : ENZYME.UNISWAP_ADAPTER;
+            if (!ethers.isAddress(IM) || !ethers.isAddress(ADP)) {
+                throw new Error("Missing IntegrationManager/Adapter addresses");
+            }
 
-            const orderData = ethers.AbiCoder.defaultAbiCoder().encode(
-                ["uint256", "uint256", "address[]"],
-                [outgoing, minIncoming, path]
+            // V2 path：address[]（可填 WETH/USDC/DAI 符號或地址）
+            const path = normalizeList(swapPath).split(",").map(toAddressLoose).filter(Boolean);
+            if (path.length < 2) throw new Error("Path must contain at least 2 token addresses (V2)");
+
+            // 讀 token decimals → 組 amountIn / minOut
+            const ercOut = new ethers.Contract(path[0], ERC20_ABI, provider || signer);
+            const ercIn = new ethers.Contract(path[path.length - 1], ERC20_ABI, provider || signer);
+            const outDec = await ercOut.decimals().catch(() => 18);
+            const inDec = await ercIn.decimals().catch(() => 18);
+
+            const amountIn = ethers.parseUnits(String(sellAmt || "0"), Number(outDec));
+            const minAmount = ethers.parseUnits(String(minBuyAmt || "0"), Number(inDec));
+            if (amountIn <= 0n) throw new Error("Sell amount must be > 0");
+
+            // --- 重要：V2 的 orderData 形狀（對齊 TA 的 hint）
+            // abi.encode(address[] path, uint256 amountIn, uint256 minAmountOut)
+            const coder = ethers.AbiCoder.defaultAbiCoder();
+            const orderData = coder.encode(["address[]", "uint256", "uint256"], [path, amountIn, minAmount]);
+
+            // selector 必須是 takeOrder(address,bytes,bytes)
+            const sel = new ethers.Interface(["function takeOrder(address,bytes,bytes)"]).getFunction("takeOrder").selector;
+
+            // （可選但很實用）先請 Adapter 自我檢查，避免 "_selector invalid"
+            const adp = new ethers.Contract(
+                ADP,
+                ["function parseAssetsForAction(bytes4,bytes) view returns (uint8,uint256,address[],uint256[],address[],uint256[])"],
+                provider || signer
             );
+            await adp.parseAssetsForAction.staticCall(sel, orderData);
 
-            const uniIface = new ethers.Interface(UNISWAP_ADAPTER_ABI);
-            const selector = uniIface.getFunction("takeOrder").selector;
+            // 打包 callArgs → Comptroller.callOnExtension(IM, 0, callArgs)
+            const callArgs = coder.encode(["address", "bytes4", "bytes"], [ADP, sel, orderData]);
 
-            const callArgs = ethers.AbiCoder.defaultAbiCoder().encode(
-                ["address", "bytes4", "bytes"],
-                [ENZYME.UNISWAP_V2_EXCHANGE_ADAPTER, selector, orderData]
-            );
+            const cp = new ethers.Contract(cpAddrUse, ["function callOnExtension(address,uint256,bytes)"], signer);
+            // Dry-run
+            await cp.callOnExtension.staticCall(IM, 0, callArgs);
 
-            const vp = new ethers.Contract(vault, VAULT_PROXY_ABI, signer);
-            const tx = await vp.callOnExtension(ENZYME.INTEGRATION_MANAGER, INTEGRATION_ACTION_CALL, callArgs);
-            setStatus({ type: "info", message: `Swap via IntegrationManager…`, hash: tx.hash });
+            // 送交易
+            const tx = await cp.callOnExtension(IM, 0, callArgs);
+            setStatus({ type: "info", message: "Swap via IM (Uniswap V2)…", hash: tx.hash });
             const rc = await tx.wait();
             setStatus({ type: "success", message: `Swap confirmed. Block ${rc.blockNumber}.`, hash: tx.hash });
         } catch (err) {
             console.error(err);
-            setStatus({ type: "error", message: shortErr(err) });
+            // 常見原因：Vault 沒有 path[0] 足夠餘額、該交易對在 Sepolia 上沒有池、或 fund 被 policy 限制
+            setStatus({ type: "error", message: shortErr(err) || "Swap reverted. Check vault balances/pair existence/policies." });
         }
     }
-    // Try to detect denom via a tiny ABI; if your fork truly has no getter, this will throw and we fall back to manual
+
+    // ===== Denomination helpers =====
     async function detectDenominationAddress(e) {
         try {
-            // 若在 <form> 內，避免觸發 submit 導致整頁刷新
-            if (e?.preventDefault) e.preventDefault();
+            if (e?.preventDefault) e.preventDefault(); // 避免 form reload
             if (!provider) throw new Error("Connect wallet first");
             if (!ethers.isAddress(cpAddr)) throw new Error("Invalid ComptrollerProxy");
             const ABI = ["function getDenominationAsset() view returns (address)"];
             const cp = new ethers.Contract(cpAddr, ABI, provider);
             const addr = await cp.getDenominationAsset();
             if (!ethers.isAddress(addr)) throw new Error("Getter returned non-address");
-            setDenomAddr(addr);
+            setDenomAddr(ethers.getAddress(addr)); // 強制 checksum
             try {
                 const erc = new ethers.Contract(addr, ERC20_ABI, provider);
                 const [sym, dec] = await Promise.all([erc.symbol(), erc.decimals()]);
                 setDenomSymbol(sym);
                 setDenomDecimals(Number(dec));
             } catch { }
-            setStatus({ type: "success", message: `Detected denomination asset: ${addr}` });
+            setStatus({ type: "success", message: `Detected denomination asset: ${ethers.getAddress(addr)}` });
         } catch (err) {
             console.error(err);
-            setStatus({
-                type: "error",
-                message: shortErr(err) || "Cannot detect denomination asset on this comptroller. Please paste the token address manually."
-            });
+            setStatus({ type: "error", message: shortErr(err) || "Cannot detect denomination asset on this comptroller. Please paste the token address manually." });
         }
     }
 
-    // Resolve denom: prioritize manual field; else try detect; else error
     async function resolveDenominationAddressOrThrow() {
         if (ethers.isAddress(denomAddr)) return denomAddr;
-        // last chance: try detect once
         try {
             const ABI = ["function getDenominationAsset() view returns (address)"];
             const cp = new ethers.Contract(cpAddr, ABI, provider || signer);
@@ -542,57 +563,42 @@ export default function App() {
         throw new Error("Denomination asset unknown. Paste the token address in the Invest panel.");
     }
 
-    // Estimate minShares with a slippage buffer (default 1%)
-    // Uses calcGrossShareValue() and assumes shares have 18 decimals (common in Enzyme forks)
     async function estimateMinShares(bps = 100) {
         if (!provider) throw new Error("Connect wallet first");
         if (!ethers.isAddress(cpAddr)) throw new Error("Invalid ComptrollerProxy");
         if (!investAmt || Number(investAmt) <= 0) throw new Error("Enter investment amount first");
 
         const denom = await resolveDenominationAddressOrThrow();
-
-        // Read decimals of the denom token
         const erc = new ethers.Contract(denom, ERC20_ABI, provider);
         const d = await erc.decimals();
         const investQty = ethers.parseUnits(investAmt, Number(d));
 
-        // Read current gross share value (denom per 1 share). On most forks this is compatible with the denom decimals.
         const cp = new ethers.Contract(cpAddr, COMPTROLLER_ABI, provider);
-        const gsv = await cp.calcGrossShareValue(); // uint256
+        const gsv = await cp.calcGrossShareValue();
 
-        // Guard: if gsv is 0 (e.g., brand-new fund) fall back to 0 (no slippage guard)
         if (gsv === 0n) {
             setMinShares("0");
             setStatus({ type: "info", message: "Share value is 0; set min shares = 0 for first subscription." });
             return;
         }
 
-        // shares = investQty * 1e18 / gsv   (shares assumed 18 decimals)
         const ONE_E18 = 10n ** 18n;
         const expectedShares = (investQty * ONE_E18) / gsv;
-
-        // apply slippage: (10000 - bps)/10000
         const min = (expectedShares * BigInt(10000 - bps)) / 10000n;
         setMinShares(ethers.formatUnits(min, 18));
         setStatus({ type: "success", message: `Estimated min shares (~${(100 - bps / 100).toFixed(2)}% of expected)` });
     }
+
     async function fetchMyShares() {
         try {
             if (!account) throw new Error("Connect wallet first");
             if (!ethers.isAddress(cpAddr)) throw new Error("Invalid ComptrollerProxy");
-
             const cp = new ethers.Contract(cpAddr, COMPTROLLER_ABI, provider || signer);
             const vault = await cp.getVaultProxy();
 
             const shares = new ethers.Contract(vault, SHARES_ABI, provider || signer);
-            const [dec, sym] = await Promise.all([
-                shares.decimals().catch(() => 18),
-                shares.symbol().catch(() => "SHARE")
-            ]);
-            const [bal, ts] = await Promise.all([
-                shares.balanceOf(account),
-                shares.totalSupply().catch(() => 0n)
-            ]);
+            const [dec, sym] = await Promise.all([shares.decimals().catch(() => 18), shares.symbol().catch(() => "SHARE")]);
+            const [bal, ts] = await Promise.all([shares.balanceOf(account), shares.totalSupply().catch(() => 0n)]);
 
             setMyShares({
                 amount: ethers.formatUnits(bal, Number(dec)),
@@ -605,16 +611,15 @@ export default function App() {
             setStatus({ type: "error", message: shortErr(err) });
         }
     }
-    // 確保 spender 的 allowance >= amt；一些代幣(如 USDT)需要先把 allowance 設 0 再設新值
+
     async function ensureAllowance(erc, owner, spender, amt, label = "spender") {
         const cur = await erc.allowance(owner, spender);
-        if (cur >= amt) return; // 已足夠
+        if (cur >= amt) return;
         try {
             const tx = await erc.approve(spender, amt);
             setStatus({ type: "info", message: `Approving ${label}…`, hash: tx.hash });
             await tx.wait();
         } catch (e) {
-            // fallback: 先清 0 再重設
             const tx0 = await erc.approve(spender, 0);
             setStatus({ type: "info", message: `Reset allowance to 0 for ${label}…`, hash: tx0.hash });
             await tx0.wait();
@@ -624,7 +629,7 @@ export default function App() {
         }
     }
 
-
+    // ===== UI =====
     const chainLabel = useMemo(() => {
         if (!chainId) return "";
         return `${networkName || "Network"} (chainId ${chainId})`;
@@ -645,10 +650,7 @@ export default function App() {
                         </div>
                     </div>
 
-                    <button
-                        onClick={connect}
-                        className="inline-flex items-center gap-2 rounded-xl bg-blue-600 text-white px-4 py-2 shadow hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-300"
-                    >
+                    <button onClick={connect} className="inline-flex items-center gap-2 rounded-xl bg-blue-600 text-white px-4 py-2 shadow hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-300">
                         <Wallet className="w-4 h-4" /> {account ? shortAddr(account) : "Connect"}
                     </button>
                 </div>
@@ -686,8 +688,7 @@ export default function App() {
                         <button
                             key={tab}
                             onClick={() => setAppTab(tab)}
-                            className={`px-4 py-2 rounded-xl border transition ${appTab === tab ? "bg-blue-600 text-white shadow hover:bg-blue-700" : "bg-white text-gray-700 hover:bg-gray-50"
-                                }`}
+                            className={`px-4 py-2 rounded-xl border transition ${appTab === tab ? "bg-blue-600 text-white shadow hover:bg-blue-700" : "bg-white text-gray-700 hover:bg-gray-50"}`}
                         >
                             {tab === "TRANSFER" ? "Transfer" : tab === "INVEST" ? "Invest" : tab === "SWAP" ? "Swap" : "Enzyme"}
                         </button>
@@ -699,23 +700,15 @@ export default function App() {
                     {/* Transfer */}
                     {appTab === "TRANSFER" && (
                         <>
-                            {/* Mode toggle */}
                             <div className="flex gap-2">
-                                <button
-                                    onClick={() => setMode("NATIVE")}
-                                    className={`px-4 py-2 rounded-xl border transition ${mode === "NATIVE" ? "bg-gray-900 text-white shadow" : "bg-white hover:bg-gray-50"}`}
-                                >
+                                <button onClick={() => setMode("NATIVE")} className={`px-4 py-2 rounded-xl border transition ${mode === "NATIVE" ? "bg-gray-900 text-white shadow" : "bg-white hover:bg-gray-50"}`}>
                                     Native
                                 </button>
-                                <button
-                                    onClick={() => setMode("ERC20")}
-                                    className={`px-4 py-2 rounded-xl border transition ${mode === "ERC20" ? "bg-gray-900 text-white shadow" : "bg-white hover:bg-gray-50"}`}
-                                >
+                                <button onClick={() => setMode("ERC20")} className={`px-4 py-2 rounded-xl border transition ${mode === "ERC20" ? "bg-gray-900 text-white shadow" : "bg-white hover:bg-gray-50"}`}>
                                     ERC-20
                                 </button>
                             </div>
 
-                            {/* Token selector */}
                             {mode === "ERC20" && (
                                 <div className="bg-white p-6 rounded-2xl shadow-lg border space-y-2">
                                     <label className="block text-sm font-medium text-gray-700 mb-1">Token contract address</label>
@@ -726,23 +719,17 @@ export default function App() {
                                         className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none"
                                     />
                                     {tokenSymbol && (
-                                        <p className="text-sm text-gray-500">
-                                            Detected: <span className="font-medium">{tokenSymbol}</span> (decimals {tokenDecimals})
-                                        </p>
+                                        <p className="text-sm text-gray-500">Detected: <span className="font-medium">{tokenSymbol}</span> (decimals {tokenDecimals})</p>
                                     )}
                                     <div className="flex items-center justify-between text-sm text-gray-500">
-                                        <span>Balance</span>
-                                        <span className="font-medium">{tokenBalance}</span>
+                                        <span>Balance</span><span className="font-medium">{tokenBalance}</span>
                                     </div>
                                     <div className="pt-1">
-                                        <button onClick={addTokenToWallet} className="text-sm px-3 py-1.5 rounded-lg border hover:bg-gray-50">
-                                            Add token to MetaMask
-                                        </button>
+                                        <button onClick={addTokenToWallet} className="text-sm px-3 py-1.5 rounded-lg border hover:bg-gray-50">Add token to MetaMask</button>
                                     </div>
                                 </div>
                             )}
 
-                            {/* Recipient & amount */}
                             <div className="bg-white p-6 rounded-2xl shadow-lg border space-y-4">
                                 <div>
                                     <label className="block text-sm font-medium text-gray-700 mb-1">Recipient address</label>
@@ -752,9 +739,7 @@ export default function App() {
                                         placeholder="0x..."
                                         className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none"
                                     />
-                                    {!recipient || isHexAddress(recipient) ? null : (
-                                        <p className="text-sm text-amber-700 mt-1">Invalid address</p>
-                                    )}
+                                    {!recipient || isHexAddress(recipient) ? null : (<p className="text-sm text-amber-700 mt-1">Invalid address</p>)}
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -787,30 +772,14 @@ export default function App() {
                             {/* Subscribe */}
                             <div className="grid gap-2">
                                 <label className="text-sm font-medium">ComptrollerProxy</label>
-                                <input
-                                    className="w-full px-4 py-2 border rounded-lg"
-                                    value={cpAddr}
-                                    onChange={e => setCpAddr(e.target.value.trim())}
-                                    placeholder="0x..."
-                                />
+                                <input className="w-full px-4 py-2 border rounded-lg" value={cpAddr} onChange={e => setCpAddr(e.target.value.trim())} placeholder="0x..." />
 
-                                {/* Denomination asset (manual or detect) */}
+                                {/* Denomination asset */}
                                 <div className="grid gap-2">
                                     <label className="text-sm font-medium">Denomination asset (ERC-20)</label>
                                     <div className="flex gap-2">
-                                        <input
-                                            className="w-full px-4 py-2 border rounded-lg"
-                                            value={denomAddr}
-                                            onChange={e => setDenomAddr(e.target.value.trim())}
-                                            placeholder="0x... (paste if detect doesn't work)"
-                                        />
-                                        <button
-                                            type="button"
-                                            onClick={(e) => detectDenominationAddress(e)}
-                                            className="px-3 py-2 rounded-lg border hover:bg-gray-50"
-                                        >
-                                            Detect
-                                        </button>
+                                        <input className="w-full px-4 py-2 border rounded-lg" value={denomAddr} onChange={e => setDenomAddr(e.target.value.trim())} placeholder="0x... (paste if detect doesn't work)" />
+                                        <button type="button" onClick={(e) => detectDenominationAddress(e)} className="px-3 py-2 rounded-lg border hover:bg-gray-50">Detect</button>
                                     </div>
                                     {denomSymbol && (
                                         <p className="text-xs text-gray-500">
@@ -822,74 +791,38 @@ export default function App() {
                                 <div className="grid md:grid-cols-2 gap-2">
                                     <div>
                                         <label className="text-sm">Investment amount</label>
-                                        <input
-                                            className="w-full px-4 py-2 border rounded-lg"
-                                            value={investAmt}
-                                            onChange={e => setInvestAmt(e.target.value.replace(/[^0-9.]/g, ""))}
-                                            placeholder="e.g. 1.0"
-                                        />
+                                        <input className="w-full px-4 py-2 border rounded-lg" value={investAmt} onChange={e => setInvestAmt(e.target.value.replace(/[^0-9.]/g, ""))} placeholder="e.g. 1.0" />
                                     </div>
                                     <div>
                                         <label className="text-sm">Min shares</label>
-                                        <input
-                                            className="w-full px-4 py-2 border rounded-lg"
-                                            value={minShares}
-                                            onChange={e => setMinShares(e.target.value.replace(/[^0-9.]/g, ""))}
-                                            placeholder="> 0 (or click Estimate)"
-                                        />
+                                        <input className="w-full px-4 py-2 border rounded-lg" value={minShares} onChange={e => setMinShares(e.target.value.replace(/[^0-9.]/g, ""))} placeholder="> 0 (or click Estimate)" />
                                     </div>
                                 </div>
 
                                 <div className="flex flex-wrap items-center gap-2 pt-1">
-                                    <button
-                                        type="button"
-                                        onClick={() => estimateMinShares(100)} // 100 bps = 1%
-                                        className="rounded-lg border px-3 py-1.5 hover:bg-gray-50"
-                                        title="Estimate with 1% slippage buffer"
-                                    >
+                                    <button type="button" onClick={() => estimateMinShares(100)} className="rounded-lg border px-3 py-1.5 hover:bg-gray-50" title="Estimate with 1% slippage buffer">
                                         Estimate min shares (1%)
                                     </button>
 
-                                    <button
-                                        onClick={handleApproveAndBuyShares}
-                                        className="rounded-xl bg-blue-600 text-white px-4 py-2 hover:bg-blue-700"
-                                    >
-                                        Approve + Buy
-                                    </button>
+                                    <button onClick={handleApproveAndBuyShares} className="rounded-xl bg-blue-600 text-white px-4 py-2 hover:bg-blue-700">Approve + Buy</button>
 
-                                    {/* 當 Denom 是 WETH：可直接用 ETH 申購；也可先 Wrap */}
                                     {denomAddr && ENZYME.WETH && denomAddr.toLowerCase() === ENZYME.WETH.toLowerCase() && (
                                         <>
-                                            <button
-                                                onClick={handleBuySharesWithEth}
-                                                className="rounded-xl bg-emerald-600 text-white px-4 py-2 hover:bg-emerald-700"
-                                                title="Pay with native ETH (buySharesWithEth)"
-                                            >
+                                            <button onClick={handleBuySharesWithEth} className="rounded-xl bg-emerald-600 text-white px-4 py-2 hover:bg-emerald-700" title="Pay with native ETH (buySharesWithEth)">
                                                 Buy with ETH
                                             </button>
-                                            <button
-                                                type="button"
-                                                onClick={wrapEthQuick}
-                                                className="rounded-lg border px-3 py-1.5 hover:bg-gray-50"
-                                                title="Wrap ETH → WETH using Investment amount"
-                                            >
+                                            <button type="button" onClick={wrapEthQuick} className="rounded-lg border px-3 py-1.5 hover:bg-gray-50" title="Wrap ETH → WETH using Investment amount">
                                                 Wrap ETH → WETH
                                             </button>
                                         </>
                                     )}
                                 </div>
 
-                                <p className="text-xs text-gray-500">
-                                    順序：先 approve（Vault / Comptroller），再 buyShares（或用 ETH 直購）。
-                                </p>
+                                <p className="text-xs text-gray-500">順序：先 approve（Vault / Comptroller），再 buyShares（或用 ETH 直購）。</p>
 
                                 {/* Shares quick view */}
                                 <div className="pt-2">
-                                    <button
-                                        type="button"
-                                        onClick={fetchMyShares}
-                                        className="rounded-lg border px-3 py-1.5 hover:bg-gray-50"
-                                    >
+                                    <button type="button" onClick={fetchMyShares} className="rounded-lg border px-3 py-1.5 hover:bg-gray-50">
                                         Refresh my shares
                                     </button>
                                     {myShares && (
@@ -909,19 +842,9 @@ export default function App() {
                             {/* Redeem */}
                             <div className="grid gap-2">
                                 <label className="text-sm font-medium">VaultProxy（可留空自動從 Comptroller 取得）</label>
-                                <input
-                                    className="w-full px-4 py-2 border rounded-lg"
-                                    value={vaultAddr}
-                                    onChange={e => setVaultAddr(e.target.value.trim())}
-                                    placeholder="0x..."
-                                />
+                                <input className="w-full px-4 py-2 border rounded-lg" value={vaultAddr} onChange={e => setVaultAddr(e.target.value.trim())} placeholder="0x..." />
                                 <label className="text-sm">Shares to redeem</label>
-                                <input
-                                    className="w-full px-4 py-2 border rounded-lg"
-                                    value={redeemShares}
-                                    onChange={e => setRedeemShares(e.target.value.replace(/[^0-9.]/g, ""))}
-                                    placeholder="e.g. 10.0"
-                                />
+                                <input className="w-full px-4 py-2 border rounded-lg" value={redeemShares} onChange={e => setRedeemShares(e.target.value.replace(/[^0-9.]/g, ""))} placeholder="e.g. 10.0" />
                                 <div className="flex gap-2">
                                     <button onClick={handleRedeemInKind} className="rounded-xl bg-gray-900 text-white px-4 py-2">Redeem In-Kind</button>
                                     <button onClick={handleRedeemSpecific} className="rounded-xl bg-emerald-500 text-white px-4 py-2 hover:bg-emerald-600">Redeem Specific</button>
@@ -929,39 +852,61 @@ export default function App() {
                                 <div className="grid md:grid-cols-2 gap-2">
                                     <div>
                                         <label className="text-sm">Specific assets (comma)</label>
-                                        <input
-                                            className="w-full px-4 py-2 border rounded-lg"
-                                            value={redeemAssets}
-                                            onChange={e => setRedeemAssets(e.target.value)}
-                                            placeholder="0xUSDC,0xWETH"
-                                        />
+                                        <input className="w-full px-4 py-2 border rounded-lg" value={redeemAssets} onChange={e => setRedeemAssets(e.target.value)} placeholder="0x...,0x... 或 WETH,USDC" />
                                     </div>
                                     <div>
-                                        <label className="text-sm">Percentages (comma, sum=10000)</label>
-                                        <input
-                                            className="w-full px-4 py-2 border rounded-lg"
-                                            value={redeemPercents}
-                                            onChange={e => setRedeemPercents(e.target.value)}
-                                            placeholder="7000,3000"
-                                        />
+                                        <label className="text-sm">Percentages (sum=10000 or 70,30 / 0.7,0.3)</label>
+                                        <input className="w-full px-4 py-2 border rounded-lg" value={redeemPercents} onChange={e => setRedeemPercents(e.target.value)} placeholder="7000,3000 / 70,30 / 0.7,0.3" />
                                     </div>
                                 </div>
-                                <p className="text-xs text-gray-500">In-Kind 依持倉比例；Specific 可指定資產與比例（總和需 10000）。</p>
+                                <p className="text-xs text-gray-500">In-Kind 依持倉比例；Specific 可指定資產與比例（可填小數或百分比，會自動換算成 10000 bps）。</p>
                             </div>
                         </div>
                     )}
 
-                    {/* Swap */}
+                    {/* Swap (Uniswap V2) */}
                     {appTab === "SWAP" && (
                         <div className="bg-white p-6 rounded-2xl shadow-lg border grid gap-3">
-                            <h2 className="text-lg font-semibold">Swap via IntegrationManager (Uniswap)</h2>
-                            <label className="text-sm">ComptrollerProxy</label>
+                            <h2 className="text-lg font-semibold">Swap via IntegrationManager (Uniswap V2)</h2>
+
+                            <div className="grid md:grid-cols-2 gap-2">
+                                <div>
+                                    <label className="text-sm">ComptrollerProxy</label>
+                                    <input
+                                        className="w-full px-4 py-2 border rounded-lg"
+                                        value={fundCpForSwap}
+                                        onChange={e => setFundCpForSwap(e.target.value.trim())}
+                                        placeholder="0x..."
+                                    />
+                                </div>
+                                <div className="flex items-end gap-2">
+                                    <button
+                                        type="button"
+                                        className="px-3 py-2 rounded-lg border hover:bg-gray-50"
+                                        onClick={() => setFundCpForSwap(cpAddr)}
+                                        title="Use Comptroller from Invest tab"
+                                    >
+                                        Use Invest CP
+                                    </button>
+                                </div>
+                            </div>
+
+                            <label className="text-sm font-medium">IntegrationManager</label>
                             <input
                                 className="w-full px-4 py-2 border rounded-lg"
-                                value={fundCpForSwap}
-                                onChange={e => setFundCpForSwap(e.target.value.trim())}
-                                placeholder="0x..."
+                                value={imAddr}
+                                onChange={e => setImAddr(e.target.value.trim())}
+                                placeholder={ENZYME.INTEGRATION_MANAGER}
                             />
+
+                            <label className="text-sm font-medium">Uniswap V2 Adapter</label>
+                            <input
+                                className="w-full px-4 py-2 border rounded-lg"
+                                value={uniAdapter}
+                                onChange={e => setUniAdapter(e.target.value.trim())}
+                                placeholder={ENZYME.UNISWAP_ADAPTER}
+                            />
+
                             <div className="grid md:grid-cols-3 gap-2">
                                 <div>
                                     <label className="text-sm">Sell amount</label>
@@ -969,7 +914,7 @@ export default function App() {
                                         className="w-full px-4 py-2 border rounded-lg"
                                         value={sellAmt}
                                         onChange={e => setSellAmt(e.target.value.replace(/[^0-9.]/g, ""))}
-                                        placeholder="e.g. 1.0"
+                                        placeholder="e.g. 0.001"
                                     />
                                 </div>
                                 <div>
@@ -978,25 +923,47 @@ export default function App() {
                                         className="w-full px-4 py-2 border rounded-lg"
                                         value={minBuyAmt}
                                         onChange={e => setMinBuyAmt(e.target.value.replace(/[^0-9.]/g, ""))}
-                                        placeholder="e.g. 3000"
+                                        placeholder="e.g. 20"
                                     />
                                 </div>
                                 <div>
-                                    <label className="text-sm">Path (comma)</label>
+                                    <label className="text-sm">Path (V2, address[])</label>
                                     <input
                                         className="w-full px-4 py-2 border rounded-lg"
                                         value={swapPath}
                                         onChange={e => setSwapPath(e.target.value)}
-                                        placeholder="0xWETH,0xDAI"
+                                        placeholder="WETH,USDC 或 0xWETH,0xUSDC"
                                     />
                                 </div>
                             </div>
-                            <button onClick={handleSwapViaIM} className="justify-self-start rounded-xl bg-blue-600 text-white px-4 py-2 hover:bg-blue-700">
-                                Swap
-                            </button>
-                            <p className="text-xs text-gray-500">路由：VaultProxy.callOnExtension(IntegrationManager, 0, encode(adapter, selector, orderData)).</p>
+
+                            <div className="flex gap-2">
+                                <button
+                                    type="button"
+                                    className="rounded-lg border px-3 py-1.5 hover:bg-gray-50"
+                                    onClick={() => {
+                                        setImAddr(ENZYME.INTEGRATION_MANAGER);
+                                        setUniAdapter(ENZYME.UNISWAP_ADAPTER);
+                                        setSwapPath("WETH,USDC");
+                                        if (!sellAmt) setSellAmt("0.001");
+                                        if (!minBuyAmt) setMinBuyAmt("0"); // 先測通路；跑通後再加滑點保護
+                                    }}
+                                >
+                                    Fill example (WETH→USDC)
+                                </button>
+
+                                <button onClick={handleSwapViaIM} className="rounded-xl bg-blue-600 text-white px-4 py-2 hover:bg-blue-700">
+                                    Swap
+                                </button>
+                            </div>
+
+                            <p className="text-xs text-gray-500">
+                                V2 使用 <code>orderData = abi.encode(outgoing, minIncoming, path)</code>，
+                                selector 固定為 <code>takeOrder(bytes)</code>，path 僅為 <code>address[]</code>（不可帶 fee）。
+                            </p>
                         </div>
                     )}
+
 
                     {/* Enzyme (Create Fund) */}
                     {appTab === "ENZYME" && (
@@ -1006,9 +973,7 @@ export default function App() {
                                 {chainId && chainId !== REQUIRED_CHAIN_ID && (
                                     <div className="flex items-center gap-2">
                                         <span className="text-sm text-amber-700">Wrong network (chainId {chainId}).</span>
-                                        <button onClick={switchToSepolia} className="text-sm rounded-lg bg-gray-900 text-white px-3 py-1.5 hover:opacity-90">
-                                            Switch
-                                        </button>
+                                        <button onClick={switchToSepolia} className="text-sm rounded-lg bg-gray-900 text-white px-3 py-1.5 hover:opacity-90">Switch</button>
                                     </div>
                                 )}
                             </div>
@@ -1016,55 +981,27 @@ export default function App() {
                             <div className="grid gap-4">
                                 <div>
                                     <label className="block text-sm font-medium text-gray-700 mb-1">Fund name</label>
-                                    <input
-                                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none"
-                                        value={fundName}
-                                        onChange={(e) => setFundName(e.target.value)}
-                                    />
+                                    <input className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none" value={fundName} onChange={(e) => setFundName(e.target.value)} />
                                 </div>
 
                                 <div>
                                     <label className="block text-sm font-medium text-gray-700 mb-1">Fund symbol</label>
-                                    <input
-                                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none"
-                                        value={fundSymbol}
-                                        onChange={(e) => setFundSymbol(e.target.value)}
-                                    />
+                                    <input className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none" value={fundSymbol} onChange={(e) => setFundSymbol(e.target.value)} />
                                 </div>
 
                                 <div>
                                     <label className="block text-sm font-medium text-gray-700 mb-1">Fee recipient (for entrance fee)</label>
-                                    <input
-                                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none"
-                                        placeholder="0x..."
-                                        value={feeRecipient}
-                                        onChange={(e) => setFeeRecipient(e.target.value)}
-                                    />
+                                    <input className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none" placeholder="0x..." value={feeRecipient} onChange={(e) => setFeeRecipient(e.target.value)} />
                                 </div>
 
                                 <div className="grid gap-2">
                                     <label className="block text-sm font-medium text-gray-700">Whitelist addresses (comma-separated)</label>
-                                    <textarea
-                                        rows={3}
-                                        placeholder="0xabc...,0xdef..."
-                                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none"
-                                        value={whitelist}
-                                        onChange={(e) => setWhitelist(e.target.value)}
-                                    />
+                                    <textarea rows={3} placeholder="0xabc...,0xdef..." className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none" value={whitelist} onChange={(e) => setWhitelist(e.target.value)} />
                                     <div className="flex gap-2">
-                                        <button onClick={handleCreateWhitelist} className="rounded-xl bg-blue-600 text-white px-4 py-2 hover:bg-blue-700">
-                                            Create whitelist
-                                        </button>
-                                        <input
-                                            className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none"
-                                            placeholder="Or paste existing listId (uint256)"
-                                            value={listId}
-                                            onChange={(e) => setListId(e.target.value)}
-                                        />
+                                        <button onClick={handleCreateWhitelist} className="rounded-xl bg-blue-600 text-white px-4 py-2 hover:bg-blue-700">Create whitelist</button>
+                                        <input className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-300 focus:border-emerald-300 outline-none" placeholder="Or paste existing listId (uint256)" value={listId} onChange={(e) => setListId(e.target.value)} />
                                     </div>
-                                    <p className="text-xs text-gray-500">
-                                        You can either create a new whitelist or paste an existing <code>listId</code>.
-                                    </p>
+                                    <p className="text-xs text-gray-500">You can either create a new whitelist or paste an existing <code>listId</code>.</p>
                                 </div>
 
                                 <button className="rounded-xl bg-emerald-500 text-white px-4 py-2 hover:bg-emerald-600" onClick={handleCreateFund}>
@@ -1084,10 +1021,8 @@ export default function App() {
                     {/* Status */}
                     {status && (
                         <div
-                            className={`rounded-2xl p-4 flex items-start gap-3 border ${status.type === "error"
-                                ? "border-red-300 bg-red-50 text-red-900"
-                                : status.type === "success"
-                                    ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+                            className={`rounded-2xl p-4 flex items-start gap-3 border ${status.type === "error" ? "border-red-300 bg-red-50 text-red-900"
+                                : status.type === "success" ? "border-emerald-300 bg-emerald-50 text-emerald-900"
                                     : "border-blue-300 bg-blue-50 text-blue-900"
                                 }`}
                         >
@@ -1108,7 +1043,7 @@ export default function App() {
         </div>
     );
 
-    // ===== handlers =====
+    // ===== Create whitelist / fund =====
     async function handleCreateWhitelist() {
         try {
             if (!signer) throw new Error("Connect wallet first");
@@ -1135,11 +1070,7 @@ export default function App() {
                 setListId(newId);
                 setStatus({ type: "success", message: `Whitelist created. listId=${newId}`, hash: tx.hash });
             } else {
-                setStatus({
-                    type: "success",
-                    message: `Whitelist created. Couldn’t parse listId; check tx on explorer`,
-                    hash: tx.hash,
-                });
+                setStatus({ type: "success", message: `Whitelist created. Couldn’t parse listId; check tx on explorer`, hash: tx.hash });
             }
         } catch (err) {
             console.error(err);
@@ -1165,24 +1096,13 @@ export default function App() {
 
             const policy_full =
                 listIdNum && listIdNum > 0n
-                    ? coder.encode(
-                        ["address[]", "bytes[]"],
-                        [[ENZYME.ALLOWED_DEPOSIT_RECIPIENTS_POLICY], [coder.encode(["uint256[]", "bytes[]"], [[listIdNum], []])]]
-                    )
+                    ? coder.encode(["address[]", "bytes[]"], [[ENZYME.ALLOWED_DEPOSIT_RECIPIENTS_POLICY], [coder.encode(["uint256[]", "bytes[]"], [[listIdNum], []])]])
                     : coder.encode(["address[]", "bytes[]"], [[], []]);
 
             const empty_cfg = coder.encode(["address[]", "bytes[]"], [[], []]);
 
             async function tryVariant(label, denom, feeData, polData) {
-                const [predComp, predVault] = await factory.createNewFund.staticCall(
-                    account,
-                    fundName,
-                    fundSymbol,
-                    denom,
-                    0n,
-                    feeData,
-                    polData
-                );
+                const [predComp, predVault] = await factory.createNewFund.staticCall(account, fundName, fundSymbol, denom, 0n, feeData, polData);
                 const tx = await factory.createNewFund(account, fundName, fundSymbol, denom, 0n, feeData, polData);
                 setStatus({ type: "info", message: `Deploying fund… (${label})`, hash: tx.hash });
                 const receipt = await tx.wait();
@@ -1222,7 +1142,7 @@ export default function App() {
     }
 }
 
-// ===== helpers =====
+// ===== helpers (string/format) =====
 function shortAddr(addr) {
     if (!addr) return "";
     return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
@@ -1233,4 +1153,54 @@ function shortErr(err) {
 }
 function capitalize(s) {
     return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
+
+// ----- flexible parsing for assets & percents -----
+function normalizeList(s) {
+    return (s || "")
+        .replace(/[，、\n\t\r ]+/g, ",") // 全形逗號/空白/換行 → 逗號
+        .replace(/,+/g, ",")
+        .replace(/^,|,$/g, "");
+}
+function toAddressLoose(s) {
+    const t = (s || "").trim();
+    if (!t) return null;
+    // 允許符號名：WETH/USDC/DAI → 由 ENZYME 映射
+    const U = t.toUpperCase();
+    const map = {
+        WETH: ENZYME?.WETH,
+        USDC: ENZYME?.USDC,
+        DAI: ENZYME?.DAI,
+    };
+    if (map[U]) { try { return ethers.getAddress(map[U]); } catch { } }
+    // 允許任意大小寫地址：轉小寫再 checksum
+    try { if (ethers.isAddress(t)) return ethers.getAddress(t); } catch { }
+    const lower = t.toLowerCase();
+    if (/^0x[0-9a-f]{40}$/.test(lower)) { try { return ethers.getAddress(lower); } catch { } }
+    return null;
+}
+function parseAssetsFlexible(input) {
+    return normalizeList(input).split(",").filter(Boolean).map(toAddressLoose).filter(Boolean);
+}
+function parsePercentsToBps(input) {
+    const nums = normalizeList(input).split(",").filter(Boolean).map(Number);
+    if (nums.length === 0 || nums.some(n => !Number.isFinite(n))) {
+        throw new Error("Percentages must be numbers");
+    }
+    const sum = nums.reduce((a, b) => a + b, 0);
+    let bps;
+    if (sum > 0.999 && sum < 1.001) {          // 0.7,0.3
+        bps = nums.map(n => Math.round(n * 10000));
+    } else if (sum > 99.9 && sum < 100.1) {    // 70,30
+        bps = nums.map(n => Math.round(n * 100));
+    } else {
+        bps = nums.map(n => Math.round(n));      // 已是 bps
+    }
+    // 修正四捨五入造成的總和誤差
+    const diff = 10000 - bps.reduce((a, b) => a + b, 0);
+    bps[bps.length - 1] += diff;
+    if (bps.some(n => n < 0) || bps.reduce((a, b) => a + b, 0) !== 10000) {
+        throw new Error("Percentages must sum to 10000");
+    }
+    return bps;
 }
