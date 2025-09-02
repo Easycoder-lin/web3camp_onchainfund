@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Onchain Fund DApp (Sepolia)</title>
+    <!-- Ethers.js library for interacting with the Ethereum blockchain -->
+    <script src="https://cdn.ethers.io/lib/ethers-5.7.2.umd.min.js" type="application/javascript"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f4f6f8; color: #333; }
+        .container { max-width: 900px; margin: 2rem auto; padding: 1rem; }
+        header { background-color: #fff; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); text-align: center; margin-bottom: 2rem; }
+        h1 { margin: 0; color: #1a202c; }
+        .connect-btn { background-color: #4299e1; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; transition: background-color 0.2s; }
+        .connect-btn:hover { background-color: #3182ce; }
+        #wallet-info { margin-top: 1rem; color: #718096; font-family: monospace; }
+        .card { background-color: #fff; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); margin-bottom: 1.5rem; }
+        h2 { margin-top: 0; border-bottom: 1px solid #e2e8f0; padding-bottom: 0.5rem; color: #2d3748; }
+        .form-group { margin-bottom: 1rem; }
+        label { display: block; font-weight: 600; margin-bottom: 0.5rem; }
+        input[type="text"], input[type="number"], textarea { width: 100%; padding: 10px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box; }
+        textarea { resize: vertical; }
+        .btn { background-color: #38a169; color: white; border: none; padding: 12px 20px; border-radius: 6px; font-size: 15px; cursor: pointer; transition: background-color 0.2s; }
+        .btn:disabled { background-color: #a0aec0; cursor: not-allowed; }
+        .btn-secondary { background-color: #718096; }
+        .btn-danger { background-color: #e53e3e; }
+        #log-area { background-color: #1a202c; color: #c7d2fe; font-family: monospace; padding: 1rem; border-radius: 6px; height: 200px; overflow-y: scroll; white-space: pre-wrap; margin-top: 1rem; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+        .fund-info { background-color: #edf2f7; padding: 1rem; border-radius: 6px; }
+        .fund-info p { margin: 0.5rem 0; }
+        .fund-info strong { color: #2d3748; }
+
+        @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Onchain Fund DApp</h1>
+            <p style="color: #718096;">Create, invest in, and redeem from onchain funds on the Sepolia network.</p>
+            <button id="connectButton" class="connect-btn">Connect Wallet</button>
+            <div id="wallet-info">Not Connected</div>
+        </header>
+
+        <div class="card">
+            <h2>1. Create a New Fund</h2>
+            <div class="form-group">
+                <label for="fundName">Fund Name (e.g., "My Tech Fund")</label>
+                <input type="text" id="fundName" placeholder="My Tech Fund">
+            </div>
+            <div class="form-group">
+                <label for="fundSymbol">Fund Symbol (e.g., "MTF")</label>
+                <input type="text" id="fundSymbol" placeholder="MTF">
+            </div>
+            <div class="form-group">
+                <label for="whitelistAddresses">Investor Whitelist (comma-separated addresses)</label>
+                <textarea id="whitelistAddresses" rows="3" placeholder="0xAddress1, 0xAddress2, ..."></textarea>
+            </div>
+            <button id="createFundButton" class="btn" disabled>Create Fund</button>
+        </div>
+
+        <div class="card">
+            <h2>2. Manage an Existing Fund</h2>
+            <div class="form-group">
+                <label for="comptrollerAddress">Fund Comptroller Address</label>
+                <input type="text" id="comptrollerAddress" placeholder="0x...">
+            </div>
+            <button id="loadFundButton" class="btn btn-secondary">Load Fund Data</button>
+            <div id="fund-details" style="display: none; margin-top: 1rem;">
+                <h3>Fund Details</h3>
+                <div id="fund-info-content" class="fund-info"></div>
+                <div class="grid">
+                    <div>
+                        <h4>Invest (Subscribe)</h4>
+                        <div class="form-group">
+                            <label for="investmentAmount">Investment Amount (<span id="denominationSymbol"></span>)</label>
+                            <input type="number" id="investmentAmount" placeholder="1.0">
+                        </div>
+                        <button id="investButton" class="btn">Approve & Invest</button>
+                    </div>
+                    <div>
+                        <h4>Withdraw (Redeem)</h4>
+                         <div class="form-group">
+                            <label for="redeemAmount">Shares to Redeem</label>
+                            <input type="number" id="redeemAmount" placeholder="10.0">
+                        </div>
+                        <button id="redeemButton" class="btn btn-danger">Redeem Shares</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Activity Log</h2>
+            <div id="log-area"></div>
+        </div>
+    </div>
+
+    <script src="https://cdn.ethers.io/lib/ethers-5.7.2.umd.min.js" type="application/javascript"></script>
+    <!-- The defer attribute ensures the script runs after the HTML document is fully parsed -->
+    <script src="app.js" defer></script>
+</body>
+</html>
