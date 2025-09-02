@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+body {
+  font-family: 'Inter', 'Noto Sans TC', sans-serif;
+  background-color: #f0f8ff; /* Alice Blue */
+}
